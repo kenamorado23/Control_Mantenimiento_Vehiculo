@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
 import { supabase, isSupabaseConfigured } from './lib/supabase'
+import * as XLSX from 'xlsx'
 import { CarFront, Gauge, Wrench, Wallet, LogOut, ShieldCheck, CircleAlert, Plus, CalendarClock, LayoutDashboard, Pencil, Trash2, X, Save, ArrowLeft } from 'lucide-react'
 
 const today = () => {
   const d = new Date()
   return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
 }
-const blankVehicle = { year: new Date().getFullYear(), model: '', plate: '', current_mileage: '', mileage_unit: 'millas' }
+const blankVehicle = { year: new Date().getFullYear(), model: '', plate: '', current_mileage: '', mileage_unit: 'millas', image_url: '' }
 const blankService = { vehicle_id: '', service_date: today(), mileage: '', category: 'Cambio de aceite', description: '', brand_reference: '', quantity: '', parts_cost: '0', labor_cost: '0', provider: '', next_service_date: '', next_service_mileage: '', status: 'Realizado', notes: '' }
 const money = n => Number(n || 0).toLocaleString('es-HN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
@@ -42,6 +43,9 @@ function App() {
   const [editing, setEditing] = useState(null)
   const [vehicleForm, setVehicleForm] = useState(blankVehicle)
   const [serviceForm, setServiceForm] = useState(blankService)
+  const [vehicleImage, setVehicleImage] = useState(null)
+  const [importPreview, setImportPreview] = useState(null)
+  const [importBusy, setImportBusy] = useState(false)
 
   useEffect(() => {
     if (!isSupabaseConfigured) { setLoading(false); return }
@@ -70,7 +74,8 @@ function App() {
 
   function openVehicle(vehicle = null) {
     setEditing(vehicle)
-    setVehicleForm(vehicle ? { year: vehicle.year, model: vehicle.model, plate: vehicle.plate || '', current_mileage: vehicle.current_mileage ?? 0, mileage_unit: vehicle.mileage_unit || 'millas' } : blankVehicle)
+    setVehicleForm(vehicle ? { year: vehicle.year, model: vehicle.model, plate: vehicle.plate || '', current_mileage: vehicle.current_mileage ?? 0, mileage_unit: vehicle.mileage_unit || 'millas', image_url: vehicle.image_url || '' } : blankVehicle)
+    setVehicleImage(null)
     setModal('vehicle')
   }
   function openService(record = null) {
@@ -88,7 +93,15 @@ function App() {
 
   async function saveVehicle(e) {
     e.preventDefault(); setBusy(true); setDbError('')
-    const payload = { owner_id: session.user.id, year: Number(vehicleForm.year), model: vehicleForm.model.trim(), plate: vehicleForm.plate.trim() || null, current_mileage: Number(vehicleForm.current_mileage || 0), mileage_unit: vehicleForm.mileage_unit }
+    let imageUrl = vehicleForm.image_url || null
+    if (vehicleImage) {
+      const ext = (vehicleImage.name.split('.').pop() || 'jpg').toLowerCase()
+      const path = `${session.user.id}/${crypto.randomUUID()}.${ext}`
+      const uploaded = await supabase.storage.from('vehicle-images').upload(path, vehicleImage, { upsert: false, contentType: vehicleImage.type })
+      if (uploaded.error) { notify('No se pudo subir la fotografía: ' + uploaded.error.message); setBusy(false); return }
+      imageUrl = supabase.storage.from('vehicle-images').getPublicUrl(path).data.publicUrl
+    }
+    const payload = { owner_id: session.user.id, year: Number(vehicleForm.year), model: vehicleForm.model.trim(), plate: vehicleForm.plate.trim() || null, current_mileage: Number(vehicleForm.current_mileage || 0), mileage_unit: vehicleForm.mileage_unit, image_url: imageUrl }
     const result = editing
       ? await supabase.from('vehicles').update({ ...payload, owner_id: undefined }).eq('id', editing.id).select().single()
       : await supabase.from('vehicles').insert(payload).select().single()
@@ -139,13 +152,53 @@ function App() {
     setBusy(false)
   }
 
+  async function importWorkbookData(rows) {
+    const vehicleRows = rows.vehicles || []
+    const serviceRows = rows.maintenance || []
+    const vehicleMap = new Map(vehicles.map(v => [String(v.plate || `${v.year}| ${v.model}`).trim().toLowerCase(), v.id]))
+    let addedVehicles = 0, addedServices = 0, errors = []
+    for (const row of vehicleRows) {
+      const model = String(row.model || row.modelo || row.vehiculo || '').trim()
+      const year = Number(row.year || row.anio || row.año)
+      if (!model || !year) { errors.push('Vehículo omitido: falta modelo o año.'); continue }
+      const plate = String(row.plate || row.placa || '').trim() || null
+      const key = String(plate || `${year}| ${model}`).toLowerCase()
+      if (vehicleMap.has(key)) continue
+      const payload = { owner_id: session.user.id, year, model, plate, current_mileage: Number(row.current_mileage || row.kilometraje_actual || row.kilometraje || 0), mileage_unit: String(row.mileage_unit || row.unidad || 'millas').toLowerCase().includes('km') ? 'kilometros' : 'millas', image_url: row.image_url || null }
+      const result = await supabase.from('vehicles').insert(payload).select().single()
+      if (result.error) errors.push(`Vehículo ${model}: ${result.error.message}`)
+      else { vehicleMap.set(key, result.data.id); addedVehicles++ }
+    }
+    const { data: currentVehicles } = await supabase.from('vehicles').select('*')
+    const findVehicle = row => {
+      const plate = String(row.plate || row.placa || '').trim().toLowerCase()
+      const model = String(row.model || row.modelo || row.vehiculo || '').trim().toLowerCase()
+      const year = Number(row.year || row.anio || row.año || 0)
+      return (currentVehicles || []).find(v => plate && String(v.plate || '').toLowerCase() === plate) || (currentVehicles || []).find(v => model && v.model.toLowerCase() === model && (!year || Number(v.year) === year))
+    }
+    for (const row of serviceRows) {
+      const vehicle = findVehicle(row)
+      if (!vehicle) { errors.push('Mantenimiento omitido: no coincide con un vehículo registrado (' + (row.model || row.modelo || row.vehiculo || 'sin identificar') + ').'); continue }
+      const serviceDate = row.service_date || row.fecha || row.fecha_servicio
+      const description = String(row.description || row.descripcion || row.servicio || '').trim()
+      if (!serviceDate || !description) { errors.push('Mantenimiento omitido: falta fecha o descripción.'); continue }
+      const payload = { owner_id: session.user.id, vehicle_id: vehicle.id, service_date: String(serviceDate).slice(0,10), mileage: Number(row.mileage || row.kilometraje) || null, category: String(row.category || row.categoria || 'Otro'), description, brand_reference: row.brand_reference || row.referencia || null, quantity: Number(row.quantity || row.cantidad) || null, parts_cost: Number(row.parts_cost || row.costo_repuestos || row.repuestos || 0), labor_cost: Number(row.labor_cost || row.mano_obra || 0), provider: row.provider || row.proveedor || row.taller || null, next_service_date: row.next_service_date || row.proxima_fecha || null, next_service_mileage: Number(row.next_service_mileage || row.proximo_kilometraje) || null, status: ['Realizado','Pendiente','Cancelado'].includes(row.status || row.estado) ? (row.status || row.estado) : 'Realizado', notes: row.notes || row.notas || null }
+      const result = await supabase.from('maintenance_records').insert(payload)
+      if (result.error) errors.push(`Servicio ${description}: ${result.error.message}`)
+      else addedServices++
+    }
+    await loadData()
+    notify(`Importación finalizada: ${addedVehicles} vehículos y ${addedServices} mantenimientos. ${errors.length ? errors.length + ' observaciones; revisa el detalle.' : ''}`)
+    return errors
+  }
+
   if (!isSupabaseConfigured) return <main className="setup-wrap"><div className="setup-card"><div className="brand-mark"><CarFront/></div><p className="eyebrow">AUTO CONTROL</p><h1>Configuración pendiente</h1><p>Revisa las variables VITE_SUPABASE_URL y VITE_SUPABASE_ANON_KEY en GitHub Actions.</p></div></main>
   if (loading) return <div className="loading">Cargando Auto Control…</div>
   if (!session) return <Login/>
 
   const nav = [
     ['dashboard', 'Dashboard', LayoutDashboard], ['vehicles', 'Mis vehículos', CarFront],
-    ['maintenance', 'Mantenimiento', Wrench], ['reminders', 'Recordatorios', CalendarClock], ['reports', 'Gastos y reportes', Wallet]
+    ['maintenance', 'Mantenimiento', Wrench], ['reminders', 'Recordatorios', CalendarClock], ['reports', 'Gastos y reportes', Wallet], ['data', 'Importar / Exportar', Wallet]
   ]
   const upcoming = records.filter(r => r.next_service_date || r.next_service_mileage).sort((a,b) => (a.next_service_date || '9999').localeCompare(b.next_service_date || '9999'))
   return <div className="app-shell">
@@ -172,6 +225,7 @@ function App() {
 
       {view === 'reminders' && <><div className="section-head"><div><h2>Próximos mantenimientos</h2><p className="muted">Recordatorios definidos al registrar cada servicio.</p></div></div>{upcoming.length ? <div className="table-wrap"><table><thead><tr><th>Vehículo</th><th>Servicio</th><th>Próxima fecha</th><th>Próximo kilometraje</th><th>Estado</th></tr></thead><tbody>{upcoming.map(r => <tr key={r.id}><td>{vehicleName(r.vehicle_id)}</td><td>{r.description}</td><td>{r.next_service_date || '—'}</td><td>{r.next_service_mileage ? Number(r.next_service_mileage).toLocaleString('en-US') : '—'}</td><td><span className="status-pill">{r.status}</span></td></tr>)}</tbody></table></div> : <Empty text="No hay recordatorios. Define próxima fecha o kilometraje en un servicio."/>}</>}
 
+      {view === 'data' && <DataTools vehicles={vehicles} records={records} onImport={async (data)=>{setImportBusy(true);try{await importWorkbookData(data)}finally{setImportBusy(false)}}} importBusy={importBusy} />}
       {view === 'reports' && <><section className="stats"><article className="stat"><span>INVERSIÓN TOTAL</span><strong>L. {money(total)}</strong><small>Todos los registros</small></article><article className="stat"><span>SERVICIOS</span><strong>{records.length}</strong><small>Historial acumulado</small></article><article className="stat"><span>PROMEDIO POR SERVICIO</span><strong>L. {money(records.length ? total / records.length : 0)}</strong><small>Costos registrados</small></article></section><div className="section-head"><div><h2>Gastos por vehículo</h2></div></div><div className="table-wrap"><table><thead><tr><th>Vehículo</th><th>Servicios</th><th>Inversión</th></tr></thead><tbody>{vehicles.map(v => { const rs = records.filter(r => r.vehicle_id === v.id); return <tr key={v.id}><td>{v.model}</td><td>{rs.length}</td><td>L. {money(rs.reduce((s,r) => s + Number(r.total_cost || 0),0))}</td></tr> })}</tbody></table></div></>}
     </main>
 
@@ -182,6 +236,8 @@ function App() {
         <label>Placa<input value={vehicleForm.plate} onChange={e=>setVehicleForm({...vehicleForm,plate:e.target.value.toUpperCase()})}/></label>
         <label>Kilometraje actual<input type="number" min="0" required value={vehicleForm.current_mileage} onChange={e=>setVehicleForm({...vehicleForm,current_mileage:e.target.value})}/></label>
         <label>Unidad<select value={vehicleForm.mileage_unit} onChange={e=>setVehicleForm({...vehicleForm,mileage_unit:e.target.value})}><option value="millas">Millas</option><option value="kilometros">Kilómetros</option></select></label>
+        <label className="wide">Fotografía del vehículo<input type="file" accept="image/png,image/jpeg,image/webp" onChange={e=>setVehicleImage(e.target.files?.[0] || null)}/><small className="muted">JPG, PNG o WebP. Máximo recomendado: 5 MB.</small></label>
+        {(vehicleImage || vehicleForm.image_url) && <div className="vehicle-image-preview wide"><img src={vehicleImage ? URL.createObjectURL(vehicleImage) : vehicleForm.image_url} alt="Vista previa del vehículo"/><button type="button" className="danger-ghost" onClick={()=>{setVehicleImage(null);setVehicleForm({...vehicleForm,image_url:''})}}>Quitar fotografía</button></div>}
         <div className="form-actions"><button type="button" className="secondary" onClick={closeModal}>Cancelar</button><button className="primary" disabled={busy}><Save size={16}/>{busy?'Guardando…':'Guardar vehículo'}</button></div>
       </form> : <form onSubmit={saveService} className="data-form">
         <label>Vehículo<select required value={serviceForm.vehicle_id} onChange={e=>setServiceForm({...serviceForm,vehicle_id:e.target.value})}><option value="">Selecciona vehículo</option>{vehicles.map(v=><option key={v.id} value={v.id}>{v.year} · {v.model} · {v.plate}</option>)}</select></label>
@@ -205,8 +261,53 @@ function App() {
   </div>
 }
 
+function DataTools({ vehicles, records, onImport, importBusy }) {
+  const [fileName, setFileName] = useState('')
+  const [parsed, setParsed] = useState(null)
+  const [error, setError] = useState('')
+  function exportExcel() {
+    const wb = XLSX.utils.book_new()
+    const vehicleRows = vehicles.map(v=>({year:v.year,model:v.model,plate:v.plate,current_mileage:v.current_mileage,mileage_unit:v.mileage_unit,image_url:v.image_url || ''}))
+    const serviceRows = records.map(r=>{const v=vehicles.find(x=>x.id===r.vehicle_id);return {service_date:r.service_date,year:v?.year || '',model:v?.model || '',plate:v?.plate || '',mileage:r.mileage,category:r.category,description:r.description,brand_reference:r.brand_reference,quantity:r.quantity,parts_cost:r.parts_cost,labor_cost:r.labor_cost,provider:r.provider,next_service_date:r.next_service_date,next_service_mileage:r.next_service_mileage,status:r.status,notes:r.notes}})
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(vehicleRows.length?vehicleRows:[{year:'',model:'',plate:'',current_mileage:'',mileage_unit:'millas'}]),'Vehiculos')
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(serviceRows.length?serviceRows:[{service_date:'',year:'',model:'',plate:'',mileage:'',category:'',description:'',parts_cost:0,labor_cost:0}]),'Mantenimientos')
+    XLSX.writeFile(wb,'Auto_Control_Respaldo.xlsx')
+  }
+  function downloadTemplate() {
+    const wb=XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet([{year:2013,model:'Hyundai Elantra GLS',plate:'HBN7218',current_mileage:105340,mileage_unit:'millas'}]),'Vehiculos')
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet([{service_date:'2026-01-15',year:2013,model:'Hyundai Elantra GLS',plate:'HBN7218',mileage:105000,category:'Cambio de aceite',description:'Aceite y filtro',brand_reference:'5W-20',quantity:5,parts_cost:1200,labor_cost:200,provider:'Taller',next_service_date:'2026-07-15',next_service_mileage:110000,status:'Realizado',notes:''}]),'Mantenimientos')
+    XLSX.writeFile(wb,'Plantilla_Auto_Control.xlsx')
+  }
+  async function readFile(file) {
+    setError('');setParsed(null);setFileName(file?.name || '')
+    if(!file)return
+    try{
+      const wb=XLSX.read(await file.arrayBuffer(),{type:'array',cellDates:true})
+      const pick=(names)=>{const name=wb.SheetNames.find(s=>names.includes(s.toLowerCase()));return name?XLSX.utils.sheet_to_json(wb.Sheets[name],{defval:''}):[]}
+      const vehicleRows=pick(['vehiculos','vehículos','vehicles'])
+      const serviceRows=pick(['mantenimientos','maintenance','servicios'])
+      if(!vehicleRows.length&&!serviceRows.length)throw new Error('No encontré hojas llamadas Vehiculos y/o Mantenimientos. Descarga la plantilla para ver el formato.')
+      setParsed({vehicles:vehicleRows,maintenance:serviceRows})
+    }catch(e){setError(e.message || 'No se pudo leer el archivo.')}
+  }
+  return <section className="data-tools">
+    <div className="section-head"><div><h2>Respaldo e intercambio de datos</h2><p className="muted">Excel compatible con hojas de vehículos y mantenimientos.</p></div></div>
+    <div className="data-tools-grid">
+      <article className="stat"><h3>Exportar información</h3><p className="muted">Descarga todos los vehículos y su historial en un solo libro Excel.</p><button className="primary" onClick={exportExcel}>Exportar Excel</button></article>
+      <article className="stat"><h3>Plantilla de importación</h3><p className="muted">Utiliza esta plantilla para organizar tus registros antes de cargarlos.</p><button className="secondary" onClick={downloadTemplate}>Descargar plantilla</button></article>
+    </div>
+    <article className="stat import-panel"><h3>Importar desde Excel</h3><p className="muted">Selecciona un archivo .xlsx, .xls o .csv. Primero revisaremos las hojas y cantidades; después podrás confirmar la carga.</p>
+      <label className="file-picker">Archivo Excel<input type="file" accept=".xlsx,.xls,.csv" onChange={e=>readFile(e.target.files?.[0])}/></label>
+      {fileName&&<p className="tiny">{fileName}</p>}{error&&<p className="error">{error}</p>}
+      {parsed&&<div className="import-preview"><b>Vista previa detectada</b><p>{parsed.vehicles.length} vehículos · {parsed.maintenance.length} mantenimientos</p><p className="muted">Los vehículos existentes se omitirán si coinciden por placa o por año y modelo. Los mantenimientos se agregarán como nuevos registros.</p><button className="primary" disabled={importBusy} onClick={async()=>{const errs=await onImport(parsed);setError(errs?.slice(0,8).join(' ')+(errs?.length>8?' …':''));setParsed(null)}}>{importBusy?'Importando…':'Confirmar importación'}</button></div>}
+    </article>
+    <div className="notice"><CircleAlert size={18}/>Antes de importar, descarga un respaldo. La importación agrega registros; no elimina ni sobrescribe mantenimientos existentes. Verifica los datos para evitar duplicados.</div>
+  </section>
+}
+
 function VehicleCard({ vehicle, onEdit, onDelete }) {
-  return <article className="vehicle-card"><div className="vehicle-top"><div className="car-icon"><CarFront size={25}/></div><span className="year-tag">{vehicle.year}</span></div><h3>{vehicle.model}</h3><p className="muted">Placa {vehicle.plate || 'No indicada'}</p><div className="mileage"><Gauge size={17}/><strong>{Number(vehicle.current_mileage || 0).toLocaleString('en-US')}</strong><span>{vehicle.mileage_unit || 'millas'}</span></div><div className="card-foot"><span>Control individual</span><span className="status-dot">Activo</span></div><div className="card-actions"><button className="secondary" onClick={onEdit}><Pencil size={14}/> Editar</button><button className="danger-ghost" onClick={onDelete}><Trash2 size={14}/> Eliminar</button></div></article>
+  return <article className="vehicle-card"><div className="vehicle-photo">{vehicle.image_url ? <img src={vehicle.image_url} alt={vehicle.model}/> : <div className="car-icon"><CarFront size={30}/></div>}<span className="year-tag">{vehicle.year}</span></div><h3>{vehicle.model}</h3><p className="muted">Placa {vehicle.plate || 'No indicada'}</p><div className="mileage"><Gauge size={17}/><strong>{Number(vehicle.current_mileage || 0).toLocaleString('en-US')}</strong><span>{vehicle.mileage_unit || 'millas'}</span></div><div className="card-foot"><span>Control individual</span><span className="status-dot">Activo</span></div><div className="card-actions"><button className="secondary" onClick={onEdit}><Pencil size={14}/> Editar</button><button className="danger-ghost" onClick={onDelete}><Trash2 size={14}/> Eliminar</button></div></article>
 }
 function ServiceTable({ records, vehicleName, onEdit, onDelete }) {
   if (!records.length) return <Empty text="No hay registros de mantenimiento."/>
