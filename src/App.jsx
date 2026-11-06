@@ -59,7 +59,18 @@ function App() {
     setDbError('')
     const [v, r] = await Promise.all([
       supabase.from('vehicles').select('*').order('year'),
-      supabase.from('maintenance_records').select('*').order('service_date', { ascending: false }).limit(500)
+      (async () => {
+        const all = []
+        let start = 0
+        while (true) {
+          const page = await supabase.from('maintenance_records').select('*').order('service_date', { ascending: false }).range(start, start + 999)
+          if (page.error) return { data: null, error: page.error }
+          all.push(...(page.data || []))
+          if (!page.data || page.data.length < 1000) break
+          start += 1000
+        }
+        return { data: all, error: null }
+      })()
     ])
     if (v.error) setDbError('Error al cargar vehículos: ' + v.error.message)
     else setVehicles(v.data || [])
