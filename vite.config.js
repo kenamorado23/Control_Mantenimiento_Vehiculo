@@ -1,3 +1,9 @@
+
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-export default defineConfig({ plugins: [react()], base: '/control-mantenimiento-hyundai/' })
+
+export default defineConfig({
+  plugins: [react()],
+  base: '/Control_Mantenimiento_Vehiculo/'
+})
+
