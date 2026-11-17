@@ -15,23 +15,64 @@ function Login() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+  const [mode, setMode] = useState('login')
   const [busy, setBusy] = useState(false)
   async function submit(e) {
-    e.preventDefault(); setBusy(true); setError('')
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) setError('No se pudo iniciar sesión. Verifica tus credenciales.')
+    e.preventDefault(); setBusy(true); setError(''); setMessage('')
+    if (mode === 'recover') {
+      const redirectTo = window.location.origin + window.location.pathname
+      const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo })
+      if (error) setError('No se pudo enviar el correo: ' + error.message)
+      else { setMode('sent'); setMessage('Si el correo corresponde a un usuario registrado, recibirás un enlace para crear una contraseña nueva. Revisa también Spam.') }
+    } else {
+      const { error } = await supabase.auth.signInWithPassword({ email, password })
+      if (error) setError('No se pudo iniciar sesión. Verifica tus credenciales.')
+    }
     setBusy(false)
   }
   return <main className="login-wrap"><form className="login-card" onSubmit={submit}>
-    <div className="brand-mark"><CarFront size={27}/></div><p className="eyebrow">AUTO CONTROL</p><h1>Control de mantenimiento</h1><p className="muted">Acceso privado para administrar tus vehículos.</p>
-    <label>Correo administrador<input type="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="tu correo"/></label>
-    <label>Contraseña<input type="password" required value={password} onChange={e=>setPassword(e.target.value)} placeholder="••••••••"/></label>
-    {error && <p className="error">{error}</p>}<button className="primary full" disabled={busy}>{busy?'Ingresando…':'Iniciar sesión'}</button><p className="tiny"><ShieldCheck size={14}/> Acceso protegido mediante Supabase Auth</p>
+    <div className="brand-mark"><CarFront size={27}/></div><p className="eyebrow">AUTO CONTROL</p><h1>{mode === 'recover' ? 'Recuperar contraseña' : mode === 'sent' ? 'Revisa tu correo' : 'Control de mantenimiento'}</h1><p className="muted">{mode === 'recover' ? 'Te enviaremos un enlace para establecer una contraseña nueva.' : mode === 'sent' ? 'Hemos procesado tu solicitud de recuperación.' : 'Acceso privado para administrar tus vehículos.'}</p>
+    {mode !== 'sent' && <>
+      <label>Correo administrador<input type="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="tu correo"/></label>
+      {mode === 'login' && <label>Contraseña<input type="password" required value={password} onChange={e=>setPassword(e.target.value)} placeholder="••••••••"/></label>}
+    </>}
+    {error && <p className="error">{error}</p>}{message && <p className="muted">{message}</p>}
+    {mode !== 'sent' && <button className="primary full" disabled={busy}>{busy ? 'Procesando…' : mode === 'recover' ? 'Enviar enlace de recuperación' : 'Iniciar sesión'}</button>}
+    {mode === 'login' && <button type="button" className="text-button" onClick={()=>{setMode('recover');setError('');setMessage('')}}>¿Olvidaste tu contraseña?</button>}
+    {mode !== 'login' && <button type="button" className="text-button" onClick={()=>{setMode('login');setError('');setMessage('')}}>Volver al inicio de sesión</button>}
+    <p className="tiny"><ShieldCheck size={14}/> Acceso protegido mediante Supabase Auth</p>
+  </form></main>
+}
+
+function ResetPassword({ onComplete }) {
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function submit(e) {
+    e.preventDefault(); setError('')
+    if (password.length < 8) { setError('La contraseña debe tener al menos 8 caracteres.'); return }
+    if (password !== confirm) { setError('Las contraseñas no coinciden.'); return }
+    setBusy(true)
+    const { error } = await supabase.auth.updateUser({ password })
+    if (error) setError('No se pudo actualizar la contraseña: ' + error.message)
+    else onComplete()
+    setBusy(false)
+  }
+  return <main className="login-wrap"><form className="login-card" onSubmit={submit}>
+    <div className="brand-mark"><CarFront size={27}/></div><p className="eyebrow">AUTO CONTROL</p><h1>Crear nueva contraseña</h1><p className="muted">Establece una contraseña segura para tu cuenta administradora.</p>
+    <label>Nueva contraseña<input type="password" required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} placeholder="Mínimo 8 caracteres"/></label>
+    <label>Confirmar contraseña<input type="password" required minLength={8} value={confirm} onChange={e=>setConfirm(e.target.value)} placeholder="Repite la contraseña"/></label>
+    {error && <p className="error">{error}</p>}
+    <button className="primary full" disabled={busy}>{busy ? 'Guardando…' : 'Guardar nueva contraseña'}</button>
+    <p className="tiny"><ShieldCheck size={14}/> Recuperación protegida mediante Supabase Auth</p>
   </form></main>
 }
 
 function App() {
   const [session, setSession] = useState(null)
+  const [passwordRecovery, setPasswordRecovery] = useState(false)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [records, setRecords] = useState([])
@@ -50,7 +91,7 @@ function App() {
   useEffect(() => {
     if (!isSupabaseConfigured) { setLoading(false); return }
     supabase.auth.getSession().then(({ data }) => { setSession(data.session); setLoading(false) })
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => setSession(nextSession))
+    const { data: listener } = supabase.auth.onAuthStateChange((event, nextSession) => { setSession(nextSession); if (event === 'PASSWORD_RECOVERY') setPasswordRecovery(true) })
     return () => listener.subscription.unsubscribe()
   }, [])
 
@@ -206,6 +247,7 @@ function App() {
 
   if (!isSupabaseConfigured) return <main className="setup-wrap"><div className="setup-card"><div className="brand-mark"><CarFront/></div><p className="eyebrow">AUTO CONTROL</p><h1>Configuración pendiente</h1><p>Revisa las variables VITE_SUPABASE_URL y VITE_SUPABASE_ANON_KEY en GitHub Actions.</p></div></main>
   if (loading) return <div className="loading">Cargando Auto Control…</div>
+  if (passwordRecovery) return <ResetPassword onComplete={() => { setPasswordRecovery(false); setNotice('Contraseña actualizada correctamente. Ya puedes continuar en Auto Control.') }}/>
   if (!session) return <Login/>
 
   const nav = [
